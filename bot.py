@@ -11,13 +11,14 @@ Commands:
   /help                     - show all commands
   /list                     - show all added links (serial #, status, last checked)
   /add <link>                - add a link to be checked
-  /rem <serial> <link>       - remove a link (serial + link must match)
+  /rem <serial>               - remove a link by its serial number
   /change <minutes>          - change the auto-check interval for this chat
 
 Requires: pyTelegramBotAPI, requests, pytz
     pip install pyTelegramBotAPI requests pytz
 """
 
+import html
 import re
 import sqlite3
 import threading
@@ -33,12 +34,12 @@ from telebot import types
 # CONFIG - edit these before running
 # --------------------------------------------------------------------------
 
-BOT_TOKEN = "8612683484:AAGZCn7y9p2u8UYhxkFnxOC4AjFmGjEZGmU"
+BOT_TOKEN = "PUT_YOUR_BOT_TOKEN_HERE"
 
 # Only these chat IDs may use the bot. Add your own chat id (a group id or
 # your personal user id - message @userinfobot on Telegram to find yours).
 ALLOWED_CHAT_IDS = {
-    6206433961,  # <-- replace with your real chat id(s)
+    123456789,  # <-- replace with your real chat id(s)
 }
 
 DB_PATH = "urlchecker.db"
@@ -127,14 +128,12 @@ def list_links(chat_id: int):
         ).fetchall()
 
 
-def remove_link_by_serial(chat_id: int, serial: int, url: str):
+def remove_link_by_serial(chat_id: int, serial: int):
     """serial is the 1-based position in the /list ordering for this chat."""
     rows = list_links(chat_id)
     if serial < 1 or serial > len(rows):
         return None
     target = rows[serial - 1]
-    if target["url"].strip().lower() != url.strip().lower():
-        return "mismatch"
     with _db_lock, get_conn() as conn:
         conn.execute("DELETE FROM links WHERE id = ?", (target["id"],))
         conn.commit()
@@ -191,17 +190,28 @@ def now_dhaka_12h() -> str:
     return datetime.now(DHAKA_TZ).strftime("%d %b %Y, %I:%M:%S %p")
 
 
+IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg")
+
+
 def check_url(url: str):
-    """Returns (is_working, status_code_or_None, reason_text)."""
+    """Returns (is_working, status_code_or_None, reason_text, content_type_or_None)."""
     try:
         resp = requests.get(
             url, timeout=REQUEST_TIMEOUT_SECONDS, allow_redirects=True,
             headers={"User-Agent": "URLCheckerBot/1.0"},
         )
         is_working = 200 <= resp.status_code < 400
-        return is_working, resp.status_code, resp.reason
+        content_type = resp.headers.get("Content-Type", "")
+        return is_working, resp.status_code, resp.reason, content_type
     except requests.RequestException:
-        return False, None, "Request failed"
+        return False, None, "Request failed", None
+
+
+def looks_like_image(url: str, content_type: str) -> bool:
+    if content_type and content_type.lower().startswith("image/"):
+        return True
+    path = url.split("?", 1)[0].lower()
+    return path.endswith(IMAGE_EXTENSIONS)
 
 
 def is_allowed(chat_id: int) -> bool:
@@ -212,7 +222,7 @@ def is_allowed(chat_id: int) -> bool:
 # BOT
 # --------------------------------------------------------------------------
 
-bot = telebot.TeleBot(BOT_TOKEN, parse_mode=None)
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
 
 def guard(handler):
@@ -235,11 +245,14 @@ def guard(handler):
 def cmd_start(message):
     bot.reply_to(
         message,
-        "👋 Welcome to *URL Checker Bot*!\n\n"
+        "👋 Welcome to <b>URL Checker Bot</b>!\n\n"
         "I automatically check links you add and let you know the moment "
-        "a link that wasn't working starts working again.\n\n"
-        "Type /help to see all commands.",
-        parse_mode="Markdown",
+        "a link that wasn't working starts working again — with a screenshot "
+        "attached if the link is an image.\n\n"
+        "🔹 Add a link with /add\n"
+        "🔹 See everything you're tracking with /list\n"
+        "🔹 Type /help any time to see all commands\n\n"
+        f"This chat's ID: <code>{message.chat.id}</code>",
     )
 
 
@@ -249,19 +262,24 @@ def cmd_help(message):
     interval = get_interval_minutes(message.chat.id)
     bot.reply_to(
         message,
-        "*Available commands:*\n\n"
-        "/add <link> - Add a link to monitor\n"
-        "  e.g. /add https://example.com\n\n"
-        "/list - Show all added links, their serial number, status "
+        "<b>Available commands:</b>\n\n"
+        "<b>/add</b> &lt;link&gt; - Add a link to monitor\n"
+        "  e.g. <code>/add https://example.com</code>\n\n"
+        "<b>/list</b> - Show all added links: serial number, status "
         "(Working ✅ / Not Working ❌) and last checked time\n\n"
-        "/rem <serial> <link> - Remove a link\n"
-        "  e.g. /rem 2 https://example.com\n\n"
-        "/change <minutes> - Change how often links are auto-checked "
-        "for this chat\n"
-        "  e.g. /change 5\n\n"
-        f"Links are currently checked automatically every *{interval} minute(s)*.\n"
-        "When a link that was down starts working, I'll message you here.",
-        parse_mode="Markdown",
+        "<b>/check</b> &lt;serial&gt; - Check one link right now, on demand\n"
+        "  e.g. <code>/check 1</code>\n\n"
+        "<b>/rem</b> &lt;serial&gt; - Remove a link by its serial number "
+        "(see /list for numbers)\n"
+        "  e.g. <code>/rem 1</code>\n\n"
+        "<b>/change</b> &lt;minutes&gt; - Change how often links are "
+        "auto-checked for this chat\n"
+        "  e.g. <code>/change 5</code>\n\n"
+        "<b>/interval</b> - Show the current auto-check interval\n\n"
+        "<b>/clear</b> - Remove every link you're tracking (asks to confirm)\n\n"
+        f"Links are currently auto-checked every <b>{interval} minute(s)</b>.\n"
+        "When a link that was down starts working, I'll message you here — "
+        "with the image attached if the link points to a picture.",
     )
 
 
@@ -270,11 +288,18 @@ def cmd_help(message):
 def cmd_add(message):
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
-        bot.reply_to(message, "Usage: /add <link>\nExample: /add https://example.com")
+        bot.reply_to(message, "Usage: /add &lt;link&gt;\nExample: /add https://example.com")
         return
     url = normalize_url(parts[1])
     link_id = add_link(message.chat.id, url)
-    bot.reply_to(message, f"✅ Added link #{link_id_to_serial(message.chat.id, link_id)}: {url}\nIt will be checked automatically.")
+    serial = link_id_to_serial(message.chat.id, link_id)
+    interval = get_interval_minutes(message.chat.id)
+    bot.reply_to(
+        message,
+        f"✅ Added as link #{serial}:\n{html.escape(url)}\n\n"
+        f"I'll check it automatically every {interval} minute(s) and message "
+        f"you here the moment it starts working.",
+    )
 
 
 def link_id_to_serial(chat_id, link_id) -> int:
@@ -290,10 +315,10 @@ def link_id_to_serial(chat_id, link_id) -> int:
 def cmd_list(message):
     rows = list_links(message.chat.id)
     if not rows:
-        bot.reply_to(message, "No links added yet. Use /add <link> to add one.")
+        bot.reply_to(message, "No links added yet. Use /add &lt;link&gt; to add one.")
         return
 
-    lines = ["*Your monitored links:*\n"]
+    lines = [f"<b>Your monitored links</b> ({len(rows)}):\n"]
     for i, r in enumerate(rows, start=1):
         if r["status"] == "working":
             status_text = "Working ✅"
@@ -309,36 +334,33 @@ def cmd_list(message):
         else:
             checked_text = "Never"
 
+        # html.escape keeps underscores, asterisks, etc. in the URL intact -
+        # Markdown parse mode used to misread "_" in links as italics.
+        safe_url = html.escape(r["url"])
         lines.append(
-            f"{i}. {r['url']}\n"
+            f"{i}. {safe_url}\n"
             f"   Status: {status_text}\n"
             f"   Last checked: {checked_text}"
         )
 
-    bot.reply_to(message, "\n\n".join(lines), parse_mode="Markdown")
+    bot.reply_to(message, "\n\n".join(lines))
 
 
 @bot.message_handler(commands=["rem"])
 @guard
 def cmd_rem(message):
-    parts = message.text.split(maxsplit=2)
-    if len(parts) < 3 or not parts[1].isdigit():
-        bot.reply_to(message, "Usage: /rem <serial number> <link>\nExample: /rem 2 https://example.com")
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip().isdigit():
+        bot.reply_to(message, "Usage: /rem &lt;serial number&gt;\nExample: /rem 1\n(Check /list to see current serial numbers.)")
         return
 
-    serial = int(parts[1])
-    url = normalize_url(parts[2])
-    result = remove_link_by_serial(message.chat.id, serial, url)
+    serial = int(parts[1].strip())
+    result = remove_link_by_serial(message.chat.id, serial)
 
     if result is None:
         bot.reply_to(message, f"❌ No link found at serial #{serial}. Use /list to check current numbers.")
-    elif result == "mismatch":
-        bot.reply_to(
-            message,
-            f"❌ Serial #{serial} doesn't match that link. Use /list to confirm the correct serial and URL.",
-        )
     else:
-        bot.reply_to(message, f"🗑️ Removed link #{serial}: {result['url']}")
+        bot.reply_to(message, f"🗑️ Removed link #{serial}:\n{html.escape(result['url'])}")
 
 
 @bot.message_handler(commands=["change"])
@@ -346,7 +368,7 @@ def cmd_rem(message):
 def cmd_change(message):
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip().isdigit():
-        bot.reply_to(message, "Usage: /change <minutes>\nExample: /change 5")
+        bot.reply_to(message, "Usage: /change &lt;minutes&gt;\nExample: /change 5")
         return
 
     minutes = int(parts[1].strip())
@@ -358,33 +380,112 @@ def cmd_change(message):
     bot.reply_to(message, f"⏱️ Check interval updated. Links in this chat will now be checked every {minutes} minute(s).")
 
 
+@bot.message_handler(commands=["interval"])
+@guard
+def cmd_interval(message):
+    interval = get_interval_minutes(message.chat.id)
+    bot.reply_to(message, f"⏱️ Links in this chat are auto-checked every {interval} minute(s).\nChange it with /change &lt;minutes&gt;.")
+
+
+@bot.message_handler(commands=["check"])
+@guard
+def cmd_check(message):
+    """Check one link right now, on demand, without waiting for the auto-check."""
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip().isdigit():
+        bot.reply_to(message, "Usage: /check &lt;serial number&gt;\nExample: /check 1")
+        return
+
+    serial = int(parts[1].strip())
+    rows = list_links(message.chat.id)
+    if serial < 1 or serial > len(rows):
+        bot.reply_to(message, f"❌ No link found at serial #{serial}. Use /list to check current numbers.")
+        return
+
+    row = rows[serial - 1]
+    bot.reply_to(message, f"🔍 Checking link #{serial}...")
+    perform_check_and_notify(message.chat.id, row["id"], row["url"], row["status"], force_send=True)
+
+
+@bot.message_handler(commands=["clear"])
+@guard
+def cmd_clear(message):
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2 or parts[1].strip().lower() != "confirm":
+        count = len(list_links(message.chat.id))
+        bot.reply_to(
+            message,
+            f"⚠️ This will remove all {count} link(s) you're tracking in this chat.\n"
+            f"Type <code>/clear confirm</code> to proceed.",
+        )
+        return
+    with _db_lock, get_conn() as conn:
+        conn.execute("DELETE FROM links WHERE chat_id = ?", (message.chat.id,))
+        conn.commit()
+    bot.reply_to(message, "🗑️ All links cleared.")
+
+
 # --------------------------------------------------------------------------
 # BACKGROUND CHECKER
 # --------------------------------------------------------------------------
+
+def build_status_message(url: str, is_working: bool, code, reason: str) -> str:
+    if is_working:
+        code_text = f"{code} {reason}" if code else "200 OK"
+        status_word = "Working ✅"
+    else:
+        code_text = f"{code} {reason}" if code else "No response"
+        status_word = "Not Working ❌"
+    return (
+        f"Status: {code_text} ({status_word})\n"
+        f"URL: {html.escape(url)}\n"
+        f"Time: {now_dhaka_12h()}"
+    )
+
+
+def send_status_update(chat_id: int, url: str, is_working: bool, code, reason: str, content_type: str):
+    text = build_status_message(url, is_working, code, reason)
+
+    # If it's working and looks like an image, attach the image itself.
+    if is_working and looks_like_image(url, content_type or ""):
+        try:
+            bot.send_photo(chat_id, photo=url, caption=text)
+            return
+        except Exception as photo_err:
+            print(f"[checker] couldn't send as photo, falling back to text: {photo_err}")
+
+    try:
+        bot.send_message(chat_id, text)
+    except Exception as send_err:
+        print(f"[checker] failed to send message to {chat_id}: {send_err}")
+
+
+def perform_check_and_notify(chat_id: int, link_id: int, url: str, previous_status: str, force_send: bool = False):
+    """Runs one check, saves the result, and notifies the chat if warranted.
+
+    Automatic background checks only notify on a down -> working transition.
+    force_send=True (used by /check) always notifies, regardless of status.
+    """
+    is_working, code, reason, content_type = check_url(url)
+    now_iso = datetime.utcnow().isoformat()
+    new_status = "working" if is_working else "down"
+    update_link_status(link_id, new_status, code, now_iso)
+
+    was_working = previous_status == "working"
+    if force_send or (is_working and not was_working):
+        send_status_update(chat_id, url, is_working, code, reason, content_type)
+
+    return is_working
+
 
 def checker_loop():
     while True:
         try:
             for row in due_links():
-                is_working, code, reason = check_url(row["url"])
-                now_iso = datetime.utcnow().isoformat()
-                new_status = "working" if is_working else "down"
-                was_working = row["status"] == "working"
-
-                update_link_status(row["id"], new_status, code, now_iso)
-
-                # Notify only on a down -> working transition
-                if is_working and not was_working:
-                    code_text = f"{code} {reason}" if code else "200 OK"
-                    text = (
-                        "Status: {code_text} (Working ✅)\n"
-                        "URL: {url}\n"
-                        "Time: {time}"
-                    ).format(code_text=code_text, url=row["url"], time=now_dhaka_12h())
-                    try:
-                        bot.send_message(row["chat_id"], text)
-                    except Exception as send_err:
-                        print(f"[checker] failed to send message to {row['chat_id']}: {send_err}")
+                try:
+                    perform_check_and_notify(row["chat_id"], row["id"], row["url"], row["status"])
+                except Exception as check_err:
+                    print(f"[checker] error checking {row['url']}: {check_err}")
         except Exception as loop_err:
             print(f"[checker] error: {loop_err}")
 
