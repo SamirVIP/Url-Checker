@@ -36,8 +36,11 @@ container on a server) for it to check links continuously.
 | `/help` | Shows all commands |
 | `/list` | Shows all added links with serial number, status, and last checked time |
 | `/add <link>` | Adds a link to monitor |
-| `/rem <serial> <link>` | Removes a link (serial number **and** link must match, as a safety check) |
+| `/check <serial>` | Checks one link immediately, without waiting for the auto-check |
+| `/rem <serial>` | Removes a link by its serial number (see `/list` for current numbers) |
 | `/change <minutes>` | Changes how often this chat's links are auto-checked (e.g. `/change 5`) |
+| `/interval` | Shows the current auto-check interval for this chat |
+| `/clear` | Removes every link in this chat (asks for `/clear confirm` first) |
 
 ## How checking works
 
@@ -48,15 +51,30 @@ container on a server) for it to check links continuously.
   as "Working", anything else (or a failed request) counts as "Not
   Working".
 - A message is sent **only** on the transition from Not Working →
-  Working, in this format:
+  Working (unless you used `/check`, which always reports the result),
+  in this format:
   ```
   Status: 200 OK (Working ✅)
   URL: https://example.com
   Time: 18 Aug 2026, 09:41:12 PM
   ```
   Time is shown in Bangladesh (Asia/Dhaka) time, 12-hour format.
+- **If the working link is an image** (detected by file extension —
+  `.jpg`, `.png`, `.gif`, `.webp`, etc. — or by the response's
+  `Content-Type` header), the bot sends the image itself as a photo,
+  with the status text as the caption, instead of a plain text message.
 - `/list` always shows the current status and last-checked time for
   every link, whether working or not.
+
+### Bug fix: underscores disappearing/italicizing in links
+
+Earlier versions used Telegram's Markdown formatting, which treats
+`_..._` as *italic*. A link containing underscores (e.g.
+`.../BP_GRAND_Prize01_101.jpg`) got its underscores silently eaten by
+the parser instead of being shown as-is. The bot now uses HTML
+formatting with proper escaping (`&lt;`, `&gt;`, `&amp;`), which
+doesn't touch underscores, asterisks, or any other punctuation in
+URLs — links are always shown exactly as added.
 
 ## Data storage
 
