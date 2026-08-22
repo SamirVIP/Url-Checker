@@ -36,11 +36,16 @@ container on a server) for it to check links continuously.
 | `/help` | Shows all commands |
 | `/list` | Shows all added links with serial number, status, and last checked time |
 | `/add <link>` | Adds a link to monitor |
+| `/addmulti` | Adds several links at once — one per line (or space-separated) |
 | `/check <serial>` | Checks one link immediately, without waiting for the auto-check |
 | `/rem <serial>` | Removes a link by its serial number (see `/list` for current numbers) |
+| `/clear` | Removes every link in this chat (asks for `/clear confirm` first) |
+| `/find <keyword>` | Searches your links by keyword/domain |
+| `/stats` | Quick counts: how many working / not working / unchecked |
+| `/export` | Sends all your links as a downloadable `.txt` file |
 | `/change <minutes>` | Changes how often this chat's links are auto-checked (e.g. `/change 5`) |
 | `/interval` | Shows the current auto-check interval for this chat |
-| `/clear` | Removes every link in this chat (asks for `/clear confirm` first) |
+| `/ping` | Confirms the bot is alive and shows how long it's been running |
 
 ## How checking works
 
@@ -65,6 +70,34 @@ container on a server) for it to check links continuously.
   with the status text as the caption, instead of a plain text message.
 - `/list` always shows the current status and last-checked time for
   every link, whether working or not.
+
+### Adding many links at once
+
+`/addmulti` accepts one link per line (or separated by spaces):
+```
+/addmulti
+https://dl.dir.freefiremobile.com/common/Local/IND/config/example1.jpg
+https://dl-tata.freefireind.in/common/Local/IND/config/example2.jpg
+```
+Links you're already tracking are skipped automatically and reported
+separately, so you can paste the same batch again safely.
+
+### Bug fix: image notifications sometimes never arrived
+
+Some CDNs (including game-config hosts like the ones above) block
+requests that don't look like they're coming from a real browser —
+this includes Telegram's own server, which used to be asked to fetch
+the image URL directly for the "Working ✅" photo message. If Telegram
+couldn't fetch it, the notification silently failed to include a photo
+(or, in some cases, never sent at all).
+
+The bot now checks links with a real browser User-Agent, and when a
+link is a working image, **downloads the image itself** during that
+same check and re-uploads those bytes straight to Telegram — instead
+of just handing Telegram a URL it might not be able to reach. If for
+some reason the upload still fails, it falls back to trying the URL
+directly, and if that also fails, it still sends the plain-text status
+update, so you're never left without a notification.
 
 ### Bug fix: underscores disappearing/italicizing in links
 
