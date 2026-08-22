@@ -11,14 +11,23 @@ Commands:
   /help                     - show all commands
   /list                     - show all added links (serial #, status, last checked)
   /add <link>                - add a link to be checked
+  /addmulti                 - add several links at once, one per line
+  /check <serial>            - check one link right now, on demand
   /rem <serial>               - remove a link by its serial number
+  /clear                     - remove every link (asks to confirm)
+  /find <keyword>             - search links by keyword/domain
+  /stats                     - quick working/not-working/unchecked counts
+  /export                    - download all links as a .txt file
   /change <minutes>          - change the auto-check interval for this chat
+  /interval                  - show the current auto-check interval
+  /ping                      - check the bot is alive, show uptime
 
 Requires: pyTelegramBotAPI, requests, pytz
     pip install pyTelegramBotAPI requests pytz
 """
 
 import html
+import io
 import re
 import sqlite3
 import threading
@@ -34,18 +43,19 @@ from telebot import types
 # CONFIG - edit these before running
 # --------------------------------------------------------------------------
 
-BOT_TOKEN = "8612683484:AAEKHBcoCRIuYL66ayugc0DstSGCPCs65Sc"
+BOT_TOKEN = "PUT_YOUR_BOT_TOKEN_HERE"
 
 # Only these chat IDs may use the bot. Add your own chat id (a group id or
 # your personal user id - message @userinfobot on Telegram to find yours).
 ALLOWED_CHAT_IDS = {
-    6206433961,  # <-- replace with your real chat id(s)
+    123456789,  # <-- replace with your real chat id(s)
 }
 
 DB_PATH = "urlchecker.db"
 DEFAULT_INTERVAL_MINUTES = 2
 CHECKER_TICK_SECONDS = 15     # how often the background loop wakes up to look for due checks
 REQUEST_TIMEOUT_SECONDS = 10
+MAX_PHOTO_BYTES = 8 * 1024 * 1024   # cap for images we download and re-upload to Telegram
 DHAKA_TZ = pytz.timezone("Asia/Dhaka")
 
 # --------------------------------------------------------------------------
@@ -192,19 +202,63 @@ def now_dhaka_12h() -> str:
 
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg")
 
+# A real browser User-Agent. Many CDNs (including game-config hosts) block
+# generic/bot User-Agents outright, which used to make the checker report
+# perfectly-working image links as down. Telegram's own server fetcher gets
+# blocked by the same kind of protection, which is why we now download the
+# image ourselves below and upload the bytes instead of just handing
+# Telegram the URL.
+BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+    ),
+    "Accept": "*/*",
+}
+
+
+def _read_capped(resp, cap: int):
+    """Read a streamed response body, aborting (returns None) past `cap` bytes."""
+    chunks = []
+    total = 0
+    try:
+        for chunk in resp.iter_content(chunk_size=65536):
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > cap:
+                return None
+            chunks.append(chunk)
+    except requests.RequestException:
+        return None
+    return b"".join(chunks)
+
 
 def check_url(url: str):
-    """Returns (is_working, status_code_or_None, reason_text, content_type_or_None)."""
+    """Checks a URL and, if it's a working image, downloads it too.
+
+    Returns (is_working, status_code_or_None, reason_text,
+             content_type_or_None, image_bytes_or_None).
+    image_bytes is only populated when the link is working AND looks like
+    an image AND is under MAX_PHOTO_BYTES.
+    """
     try:
         resp = requests.get(
             url, timeout=REQUEST_TIMEOUT_SECONDS, allow_redirects=True,
-            headers={"User-Agent": "URLCheckerBot/1.0"},
+            headers=BROWSER_HEADERS, stream=True,
         )
         is_working = 200 <= resp.status_code < 400
         content_type = resp.headers.get("Content-Type", "")
-        return is_working, resp.status_code, resp.reason, content_type
+        code, reason = resp.status_code, resp.reason
+
+        image_bytes = None
+        if is_working and looks_like_image(url, content_type):
+            image_bytes = _read_capped(resp, MAX_PHOTO_BYTES)
+        resp.close()
+
+        return is_working, code, reason, content_type, image_bytes
     except requests.RequestException:
-        return False, None, "Request failed", None
+        return False, None, "Request failed", None, None
 
 
 def looks_like_image(url: str, content_type: str) -> bool:
@@ -263,8 +317,10 @@ def cmd_help(message):
     bot.reply_to(
         message,
         "<b>Available commands:</b>\n\n"
-        "<b>/add</b> &lt;link&gt; - Add a link to monitor\n"
+        "<b>/add</b> &lt;link&gt; - Add one link to monitor\n"
         "  e.g. <code>/add https://example.com</code>\n\n"
+        "<b>/addmulti</b> - Add several links at once, one per line\n"
+        "  e.g. <code>/addmulti\nhttps://a.com/1.jpg\nhttps://b.com/2.jpg</code>\n\n"
         "<b>/list</b> - Show all added links: serial number, status "
         "(Working ✅ / Not Working ❌) and last checked time\n\n"
         "<b>/check</b> &lt;serial&gt; - Check one link right now, on demand\n"
@@ -272,11 +328,16 @@ def cmd_help(message):
         "<b>/rem</b> &lt;serial&gt; - Remove a link by its serial number "
         "(see /list for numbers)\n"
         "  e.g. <code>/rem 1</code>\n\n"
+        "<b>/clear</b> - Remove every link you're tracking (asks to confirm)\n\n"
+        "<b>/find</b> &lt;keyword&gt; - Search your links by keyword/domain\n"
+        "  e.g. <code>/find freefireind</code>\n\n"
+        "<b>/stats</b> - Quick counts: working / not working / unchecked\n\n"
+        "<b>/export</b> - Download all your links as a .txt file\n\n"
         "<b>/change</b> &lt;minutes&gt; - Change how often links are "
         "auto-checked for this chat\n"
         "  e.g. <code>/change 5</code>\n\n"
         "<b>/interval</b> - Show the current auto-check interval\n\n"
-        "<b>/clear</b> - Remove every link you're tracking (asks to confirm)\n\n"
+        "<b>/ping</b> - Check the bot is alive and see its uptime\n\n"
         f"Links are currently auto-checked every <b>{interval} minute(s)</b>.\n"
         "When a link that was down starts working, I'll message you here — "
         "with the image attached if the link points to a picture.",
@@ -308,6 +369,61 @@ def link_id_to_serial(chat_id, link_id) -> int:
         if r["id"] == link_id:
             return i
     return -1
+
+
+@bot.message_handler(commands=["addmulti"])
+@guard
+def cmd_addmulti(message):
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        bot.reply_to(
+            message,
+            "Usage: /addmulti followed by one link per line (or separated "
+            "by spaces).\n\nExample:\n"
+            "/addmulti\n"
+            "https://dl.dir.freefiremobile.com/common/Local/IND/config/example1.jpg\n"
+            "https://dl-tata.freefireind.in/common/Local/IND/config/example2.jpg",
+        )
+        return
+
+    tokens = parts[1].split()
+    if not tokens:
+        bot.reply_to(message, "No links found in your message.")
+        return
+
+    existing = {r["url"].strip().lower() for r in list_links(message.chat.id)}
+    added_urls = []
+    skipped_urls = []
+    seen_this_batch = set()
+
+    for token in tokens:
+        url = normalize_url(token)
+        key = url.strip().lower()
+        if key in existing or key in seen_this_batch:
+            skipped_urls.append(url)
+            continue
+        seen_this_batch.add(key)
+        add_link(message.chat.id, url)
+        added_urls.append(url)
+
+    rows = list_links(message.chat.id)
+    url_to_serial = {r["url"]: i for i, r in enumerate(rows, start=1)}
+    interval = get_interval_minutes(message.chat.id)
+
+    lines = []
+    if added_urls:
+        lines.append(f"✅ Added {len(added_urls)} link(s):")
+        for u in added_urls:
+            lines.append(f"  #{url_to_serial.get(u, '?')}. {html.escape(u)}")
+    if skipped_urls:
+        lines.append(f"\n⏭️ Skipped {len(skipped_urls)} already-tracked or duplicate link(s):")
+        for u in skipped_urls:
+            lines.append(f"  {html.escape(u)}")
+    if not added_urls and not skipped_urls:
+        lines.append("No valid links found.")
+
+    lines.append(f"\nAll links are checked automatically every {interval} minute(s).")
+    bot.reply_to(message, "\n".join(lines))
 
 
 @bot.message_handler(commands=["list"])
@@ -425,6 +541,81 @@ def cmd_clear(message):
     bot.reply_to(message, "🗑️ All links cleared.")
 
 
+@bot.message_handler(commands=["stats"])
+@guard
+def cmd_stats(message):
+    rows = list_links(message.chat.id)
+    total = len(rows)
+    working = sum(1 for r in rows if r["status"] == "working")
+    down = sum(1 for r in rows if r["status"] == "down")
+    unknown = total - working - down
+    interval = get_interval_minutes(message.chat.id)
+    bot.reply_to(
+        message,
+        "<b>📊 Stats for this chat</b>\n\n"
+        f"Total links: {total}\n"
+        f"Working ✅: {working}\n"
+        f"Not working ❌: {down}\n"
+        f"Not checked yet ⏳: {unknown}\n"
+        f"Check interval: every {interval} minute(s)",
+    )
+
+
+@bot.message_handler(commands=["find"])
+@guard
+def cmd_find(message):
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        bot.reply_to(message, "Usage: /find &lt;keyword&gt;\nExample: /find freefireind")
+        return
+
+    keyword = parts[1].strip().lower()
+    rows = list_links(message.chat.id)
+    matches = [(i, r) for i, r in enumerate(rows, start=1) if keyword in r["url"].lower()]
+
+    if not matches:
+        bot.reply_to(message, f"No links matching '{html.escape(keyword)}'.")
+        return
+
+    lines = [f"<b>🔎 {len(matches)} match(es) for '{html.escape(keyword)}':</b>\n"]
+    for i, r in matches:
+        if r["status"] == "working":
+            status_text = "Working ✅"
+        elif r["status"] == "down":
+            status_text = "Not Working ❌"
+        else:
+            status_text = "Not checked yet ⏳"
+        lines.append(f"{i}. {html.escape(r['url'])}\n   Status: {status_text}")
+
+    bot.reply_to(message, "\n\n".join(lines))
+
+
+@bot.message_handler(commands=["export"])
+@guard
+def cmd_export(message):
+    rows = list_links(message.chat.id)
+    if not rows:
+        bot.reply_to(message, "No links to export yet.")
+        return
+
+    text = "\n".join(r["url"] for r in rows)
+    file_obj = io.BytesIO(text.encode("utf-8"))
+    file_obj.name = "monitored_links.txt"
+    bot.send_document(message.chat.id, file_obj, caption=f"📄 {len(rows)} link(s) exported.")
+
+
+BOT_START_TIME = datetime.utcnow()
+
+
+@bot.message_handler(commands=["ping"])
+@guard
+def cmd_ping(message):
+    uptime = datetime.utcnow() - BOT_START_TIME
+    hours, remainder = divmod(int(uptime.total_seconds()), 3600)
+    minutes, seconds = divmod(remainder, 60)
+    bot.reply_to(message, f"🏓 Pong! Bot has been running for {hours}h {minutes}m {seconds}s.")
+
+
 # --------------------------------------------------------------------------
 # BACKGROUND CHECKER
 # --------------------------------------------------------------------------
@@ -443,17 +634,33 @@ def build_status_message(url: str, is_working: bool, code, reason: str) -> str:
     )
 
 
-def send_status_update(chat_id: int, url: str, is_working: bool, code, reason: str, content_type: str):
+def send_status_update(chat_id: int, url: str, is_working: bool, code, reason: str,
+                        content_type: str, image_bytes):
     text = build_status_message(url, is_working, code, reason)
 
-    # If it's working and looks like an image, attach the image itself.
     if is_working and looks_like_image(url, content_type or ""):
+        # Preferred: upload the bytes we already downloaded ourselves. This
+        # is far more reliable than handing Telegram the raw URL, since
+        # Telegram's own fetcher gets blocked by the same anti-hotlink
+        # protection some CDNs use.
+        if image_bytes:
+            try:
+                photo_file = io.BytesIO(image_bytes)
+                photo_file.name = "image.jpg"
+                bot.send_photo(chat_id, photo=photo_file, caption=text)
+                return
+            except Exception as upload_err:
+                print(f"[checker] photo upload failed, trying URL: {upload_err}")
+
+        # Fallback: let Telegram try to fetch the URL itself.
         try:
             bot.send_photo(chat_id, photo=url, caption=text)
             return
         except Exception as photo_err:
-            print(f"[checker] couldn't send as photo, falling back to text: {photo_err}")
+            print(f"[checker] photo-by-url failed, falling back to text: {photo_err}")
 
+    # Final fallback: plain text status update. This always fires if both
+    # photo attempts above failed, so the chat is never left un-notified.
     try:
         bot.send_message(chat_id, text)
     except Exception as send_err:
@@ -466,14 +673,14 @@ def perform_check_and_notify(chat_id: int, link_id: int, url: str, previous_stat
     Automatic background checks only notify on a down -> working transition.
     force_send=True (used by /check) always notifies, regardless of status.
     """
-    is_working, code, reason, content_type = check_url(url)
+    is_working, code, reason, content_type, image_bytes = check_url(url)
     now_iso = datetime.utcnow().isoformat()
     new_status = "working" if is_working else "down"
     update_link_status(link_id, new_status, code, now_iso)
 
     was_working = previous_status == "working"
     if force_send or (is_working and not was_working):
-        send_status_update(chat_id, url, is_working, code, reason, content_type)
+        send_status_update(chat_id, url, is_working, code, reason, content_type, image_bytes)
 
     return is_working
 
