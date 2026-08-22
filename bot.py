@@ -43,12 +43,12 @@ from telebot import types
 # CONFIG - edit these before running
 # --------------------------------------------------------------------------
 
-BOT_TOKEN = "PUT_YOUR_BOT_TOKEN_HERE"
+BOT_TOKEN = "8612683484:AAEKHBcoCRIuYL66ayugc0DstSGCPCs65Sc"
 
 # Only these chat IDs may use the bot. Add your own chat id (a group id or
 # your personal user id - message @userinfobot on Telegram to find yours).
 ALLOWED_CHAT_IDS = {
-    123456789,  # <-- replace with your real chat id(s)
+    6206433961,  # <-- replace with your real chat id(s)
 }
 
 DB_PATH = "urlchecker.db"
