@@ -4,7 +4,8 @@ URL Checker Telegram Bot
 
 Monitors a list of URLs per chat and notifies the chat when a
 previously-down URL starts working again. Only responds to chat IDs
-listed in ALLOWED_CHAT_IDS.
+listed in ALLOWED_CHAT_IDS. Each chat can track up to MAX_LINKS_PER_CHAT
+links (default 50).
 
 Commands:
   /start                    - introduce the bot
@@ -13,7 +14,7 @@ Commands:
   /add <link>                - add a link to be checked
   /addmulti                 - add several links at once, one per line
   /check <serial>            - check one link right now, on demand
-  /rem <serial>               - remove a link by its serial number
+  /rem <serial>[, <serial>...] - remove one or more links by serial number
   /clear                     - remove every link (asks to confirm)
   /find <keyword>             - search links by keyword/domain
   /stats                     - quick working/not-working/unchecked counts
@@ -56,6 +57,7 @@ DEFAULT_INTERVAL_MINUTES = 2
 CHECKER_TICK_SECONDS = 15     # how often the background loop wakes up to look for due checks
 REQUEST_TIMEOUT_SECONDS = 10
 MAX_PHOTO_BYTES = 8 * 1024 * 1024   # cap for images we download and re-upload to Telegram
+MAX_LINKS_PER_CHAT = 50             # cap on how many links a chat can track at once
 DHAKA_TZ = pytz.timezone("Asia/Dhaka")
 
 # --------------------------------------------------------------------------
@@ -148,6 +150,43 @@ def remove_link_by_serial(chat_id: int, serial: int):
         conn.execute("DELETE FROM links WHERE id = ?", (target["id"],))
         conn.commit()
     return target
+
+
+def remove_links_by_serials(chat_id: int, serials):
+    """Removes several links at once by their /list serial numbers.
+
+    All serials are resolved against a single snapshot of the list taken
+    before any deletion, so removing e.g. 1, 2, 3 in one call behaves the
+    same as if the numbers were read straight off /list - no need to worry
+    about earlier removals shifting the numbering of later ones.
+
+    Returns (removed_rows, invalid_serials).
+    """
+    rows = list_links(chat_id)
+    total = len(rows)
+
+    valid_serials = []
+    invalid_serials = []
+    seen = set()
+    for s in serials:
+        if s in seen:
+            continue
+        seen.add(s)
+        if 1 <= s <= total:
+            valid_serials.append(s)
+        else:
+            invalid_serials.append(s)
+
+    removed_rows = [rows[s - 1] for s in valid_serials]
+    ids_to_remove = [r["id"] for r in removed_rows]
+
+    if ids_to_remove:
+        placeholders = ",".join("?" for _ in ids_to_remove)
+        with _db_lock, get_conn() as conn:
+            conn.execute(f"DELETE FROM links WHERE id IN ({placeholders})", ids_to_remove)
+            conn.commit()
+
+    return removed_rows, invalid_serials
 
 
 def update_link_status(link_id: int, status: str, status_code, checked_at_iso: str):
@@ -268,6 +307,38 @@ def looks_like_image(url: str, content_type: str) -> bool:
     return path.endswith(IMAGE_EXTENSIONS)
 
 
+TELEGRAM_MESSAGE_SAFE_LIMIT = 3500  # stay comfortably under Telegram's 4096-char cap
+
+
+def send_in_chunks(chat_id: int, blocks, reply_to_message_id=None, limit: int = TELEGRAM_MESSAGE_SAFE_LIMIT, sep: str = "\n\n"):
+    """Sends a list of text blocks as one or more messages, each under the
+    Telegram length limit. Blocks are never split mid-way - a block that
+    doesn't fit in the current chunk starts a new one. This is what makes
+    /list reliable no matter how many links a chat is tracking."""
+    chunk = ""
+    first = True
+
+    def flush():
+        nonlocal chunk, first
+        if not chunk:
+            return
+        if first and reply_to_message_id is not None:
+            bot.send_message(chat_id, chunk, reply_to_message_id=reply_to_message_id)
+        else:
+            bot.send_message(chat_id, chunk)
+        first = False
+        chunk = ""
+
+    for block in blocks:
+        candidate = f"{chunk}{sep}{block}" if chunk else block
+        if len(candidate) > limit and chunk:
+            flush()
+            chunk = block
+        else:
+            chunk = candidate
+    flush()
+
+
 def is_allowed(chat_id: int) -> bool:
     return chat_id in ALLOWED_CHAT_IDS
 
@@ -325,9 +396,9 @@ def cmd_help(message):
         "(Working ✅ / Not Working ❌) and last checked time\n\n"
         "<b>/check</b> &lt;serial&gt; - Check one link right now, on demand\n"
         "  e.g. <code>/check 1</code>\n\n"
-        "<b>/rem</b> &lt;serial&gt; - Remove a link by its serial number "
-        "(see /list for numbers)\n"
-        "  e.g. <code>/rem 1</code>\n\n"
+        "<b>/rem</b> &lt;serial&gt; - Remove one or more links by serial "
+        "number (see /list for numbers)\n"
+        "  e.g. <code>/rem 1</code> or <code>/rem 1, 2, 3</code>\n\n"
         "<b>/clear</b> - Remove every link you're tracking (asks to confirm)\n\n"
         "<b>/find</b> &lt;keyword&gt; - Search your links by keyword/domain\n"
         "  e.g. <code>/find freefireind</code>\n\n"
@@ -339,6 +410,7 @@ def cmd_help(message):
         "<b>/interval</b> - Show the current auto-check interval\n\n"
         "<b>/ping</b> - Check the bot is alive and see its uptime\n\n"
         f"Links are currently auto-checked every <b>{interval} minute(s)</b>.\n"
+        f"Each chat can track up to <b>{MAX_LINKS_PER_CHAT} links</b>.\n"
         "When a link that was down starts working, I'll message you here — "
         "with the image attached if the link points to a picture.",
     )
@@ -351,13 +423,24 @@ def cmd_add(message):
     if len(parts) < 2 or not parts[1].strip():
         bot.reply_to(message, "Usage: /add &lt;link&gt;\nExample: /add https://example.com")
         return
+
+    current_count = len(list_links(message.chat.id))
+    if current_count >= MAX_LINKS_PER_CHAT:
+        bot.reply_to(
+            message,
+            f"🚫 You've reached the limit of {MAX_LINKS_PER_CHAT} links for this chat.\n"
+            f"Remove some with /rem &lt;serial&gt; (or /rem 1, 2, 3 to remove several) "
+            f"before adding more.",
+        )
+        return
+
     url = normalize_url(parts[1])
     link_id = add_link(message.chat.id, url)
     serial = link_id_to_serial(message.chat.id, link_id)
     interval = get_interval_minutes(message.chat.id)
     bot.reply_to(
         message,
-        f"✅ Added as link #{serial}:\n{html.escape(url)}\n\n"
+        f"✅ Added as link #{serial} ({serial}/{MAX_LINKS_PER_CHAT}):\n{html.escape(url)}\n\n"
         f"I'll check it automatically every {interval} minute(s) and message "
         f"you here the moment it starts working.",
     )
@@ -382,7 +465,8 @@ def cmd_addmulti(message):
             "by spaces).\n\nExample:\n"
             "/addmulti\n"
             "https://dl.dir.freefiremobile.com/common/Local/IND/config/example1.jpg\n"
-            "https://dl-tata.freefireind.in/common/Local/IND/config/example2.jpg",
+            "https://dl-tata.freefireind.in/common/Local/IND/config/example2.jpg\n\n"
+            f"(Chats can track up to {MAX_LINKS_PER_CHAT} links in total.)",
         )
         return
 
@@ -392,8 +476,11 @@ def cmd_addmulti(message):
         return
 
     existing = {r["url"].strip().lower() for r in list_links(message.chat.id)}
+    slots_left = MAX_LINKS_PER_CHAT - len(existing)
+
     added_urls = []
-    skipped_urls = []
+    skipped_urls = []       # already tracked / duplicate within this batch
+    limit_skipped_urls = [] # would exceed MAX_LINKS_PER_CHAT
     seen_this_batch = set()
 
     for token in tokens:
@@ -402,9 +489,13 @@ def cmd_addmulti(message):
         if key in existing or key in seen_this_batch:
             skipped_urls.append(url)
             continue
+        if slots_left <= 0:
+            limit_skipped_urls.append(url)
+            continue
         seen_this_batch.add(key)
         add_link(message.chat.id, url)
         added_urls.append(url)
+        slots_left -= 1
 
     rows = list_links(message.chat.id)
     url_to_serial = {r["url"]: i for i, r in enumerate(rows, start=1)}
@@ -419,11 +510,18 @@ def cmd_addmulti(message):
         lines.append(f"\n⏭️ Skipped {len(skipped_urls)} already-tracked or duplicate link(s):")
         for u in skipped_urls:
             lines.append(f"  {html.escape(u)}")
-    if not added_urls and not skipped_urls:
+    if limit_skipped_urls:
+        lines.append(
+            f"\n🚫 Skipped {len(limit_skipped_urls)} link(s) — "
+            f"{MAX_LINKS_PER_CHAT}-link limit reached ({len(rows)}/{MAX_LINKS_PER_CHAT} now):"
+        )
+        for u in limit_skipped_urls:
+            lines.append(f"  {html.escape(u)}")
+    if not added_urls and not skipped_urls and not limit_skipped_urls:
         lines.append("No valid links found.")
 
     lines.append(f"\nAll links are checked automatically every {interval} minute(s).")
-    bot.reply_to(message, "\n".join(lines))
+    send_in_chunks(message.chat.id, lines, reply_to_message_id=message.message_id, sep="\n")
 
 
 @bot.message_handler(commands=["list"])
@@ -434,7 +532,8 @@ def cmd_list(message):
         bot.reply_to(message, "No links added yet. Use /add &lt;link&gt; to add one.")
         return
 
-    lines = [f"<b>Your monitored links</b> ({len(rows)}):\n"]
+    header = f"<b>Your monitored links</b> ({len(rows)}/{MAX_LINKS_PER_CHAT}):"
+    blocks = [header]
     for i, r in enumerate(rows, start=1):
         if r["status"] == "working":
             status_text = "Working ✅"
@@ -453,30 +552,51 @@ def cmd_list(message):
         # html.escape keeps underscores, asterisks, etc. in the URL intact -
         # Markdown parse mode used to misread "_" in links as italics.
         safe_url = html.escape(r["url"])
-        lines.append(
+        blocks.append(
             f"{i}. {safe_url}\n"
             f"   Status: {status_text}\n"
             f"   Last checked: {checked_text}"
         )
 
-    bot.reply_to(message, "\n\n".join(lines))
+    # Sent in chunks so the full list always arrives intact, no matter how
+    # many links are tracked - a single message this long would otherwise
+    # exceed Telegram's ~4096-character limit and fail to send at all.
+    send_in_chunks(message.chat.id, blocks, reply_to_message_id=message.message_id)
 
 
 @bot.message_handler(commands=["rem"])
 @guard
 def cmd_rem(message):
     parts = message.text.split(maxsplit=1)
-    if len(parts) < 2 or not parts[1].strip().isdigit():
-        bot.reply_to(message, "Usage: /rem &lt;serial number&gt;\nExample: /rem 1\n(Check /list to see current serial numbers.)")
+    if len(parts) < 2 or not parts[1].strip():
+        bot.reply_to(
+            message,
+            "Usage: /rem &lt;serial&gt;\nExample: /rem 1\n\n"
+            "Remove several at once (comma or space separated):\n"
+            "/rem 1, 2, 3\n(Check /list to see current serial numbers.)",
+        )
         return
 
-    serial = int(parts[1].strip())
-    result = remove_link_by_serial(message.chat.id, serial)
+    tokens = [t for t in re.split(r"[,\s]+", parts[1].strip()) if t]
+    if not tokens or not all(t.isdigit() for t in tokens):
+        bot.reply_to(message, "Please use only numbers (serials from /list), e.g. /rem 1, 2, 3")
+        return
 
-    if result is None:
-        bot.reply_to(message, f"❌ No link found at serial #{serial}. Use /list to check current numbers.")
-    else:
-        bot.reply_to(message, f"🗑️ Removed link #{serial}:\n{html.escape(result['url'])}")
+    serials = [int(t) for t in tokens]
+    removed_rows, invalid_serials = remove_links_by_serials(message.chat.id, serials)
+
+    lines = []
+    if removed_rows:
+        lines.append(f"🗑️ Removed {len(removed_rows)} link(s):")
+        for r in removed_rows:
+            lines.append(f"  {html.escape(r['url'])}")
+    if invalid_serials:
+        nums = ", ".join(f"#{s}" for s in invalid_serials)
+        lines.append(f"\n❌ No link found at serial(s): {nums}. Use /list to check current numbers.")
+    if not lines:
+        lines = ["Nothing removed."]
+
+    bot.reply_to(message, "\n".join(lines))
 
 
 @bot.message_handler(commands=["change"])
@@ -553,7 +673,7 @@ def cmd_stats(message):
     bot.reply_to(
         message,
         "<b>📊 Stats for this chat</b>\n\n"
-        f"Total links: {total}\n"
+        f"Total links: {total}/{MAX_LINKS_PER_CHAT}\n"
         f"Working ✅: {working}\n"
         f"Not working ❌: {down}\n"
         f"Not checked yet ⏳: {unknown}\n"
@@ -577,7 +697,7 @@ def cmd_find(message):
         bot.reply_to(message, f"No links matching '{html.escape(keyword)}'.")
         return
 
-    lines = [f"<b>🔎 {len(matches)} match(es) for '{html.escape(keyword)}':</b>\n"]
+    lines = [f"<b>🔎 {len(matches)} match(es) for '{html.escape(keyword)}':</b>"]
     for i, r in matches:
         if r["status"] == "working":
             status_text = "Working ✅"
@@ -587,7 +707,7 @@ def cmd_find(message):
             status_text = "Not checked yet ⏳"
         lines.append(f"{i}. {html.escape(r['url'])}\n   Status: {status_text}")
 
-    bot.reply_to(message, "\n\n".join(lines))
+    send_in_chunks(message.chat.id, lines, reply_to_message_id=message.message_id)
 
 
 @bot.message_handler(commands=["export"])
