@@ -35,10 +35,10 @@ container on a server) for it to check links continuously.
 | `/start` | Introduces the bot |
 | `/help` | Shows all commands |
 | `/list` | Shows all added links with serial number, status, and last checked time |
-| `/add <link>` | Adds a link to monitor |
+| `/add <link>` | Adds a link to monitor (up to the 50-link limit) |
 | `/addmulti` | Adds several links at once — one per line (or space-separated) |
 | `/check <serial>` | Checks one link immediately, without waiting for the auto-check |
-| `/rem <serial>` | Removes a link by its serial number (see `/list` for current numbers) |
+| `/rem <serial>` | Removes one or more links by serial number — `/rem 1` or `/rem 1, 2, 3` |
 | `/clear` | Removes every link in this chat (asks for `/clear confirm` first) |
 | `/find <keyword>` | Searches your links by keyword/domain |
 | `/stats` | Quick counts: how many working / not working / unchecked |
@@ -98,6 +98,36 @@ of just handing Telegram a URL it might not be able to reach. If for
 some reason the upload still fails, it falls back to trying the URL
 directly, and if that also fails, it still sends the plain-text status
 update, so you're never left without a notification.
+
+### 50-link limit per chat
+
+Each chat can track up to **50 links**. `/add` and `/addmulti` both
+enforce this — `/add` on a full list tells you to remove something
+first with `/rem`, and `/addmulti` fills whatever slots are left and
+reports which links it had to skip because the limit was reached.
+`/stats` and `/list` always show your current count out of 50.
+
+### Removing several links at once
+
+`/rem` now accepts more than one serial number, comma- and/or
+space-separated:
+```
+/rem 1, 2, 3
+/rem 4 5 6
+```
+All the numbers are read from a single snapshot of your list, so this
+behaves exactly like reading the serials straight off `/list` and
+removing each one — no need to worry about earlier removals shifting
+the numbering of later ones in the same command.
+
+### Bug fix: `/list` failing or getting cut off with many links
+
+With close to 50 links, the full list can easily exceed Telegram's
+~4096-character message limit — previously this made `/list` (and
+`/find`) fail outright with nothing shown. The bot now automatically
+splits long results across multiple messages, always keeping each
+link's block intact (never cut off mid-entry), so the full list always
+arrives correctly however many links you're tracking.
 
 ### Bug fix: underscores disappearing/italicizing in links
 
