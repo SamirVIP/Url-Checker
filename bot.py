@@ -44,7 +44,7 @@ from telebot import types
 # CONFIG - edit these before running
 # --------------------------------------------------------------------------
 
-BOT_TOKEN = "8612683484:AAEKHBcoCRIuYL66ayugc0DstSGCPCs65Sc"
+BOT_TOKEN = "8612683484:AAFFQr6JTeLYGw6LwwOA4VOkAGOn6BQ43Hs"
 
 # Only these chat IDs may use the bot. Add your own chat id (a group id or
 # your personal user id - message @userinfobot on Telegram to find yours).
