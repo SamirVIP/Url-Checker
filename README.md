@@ -18,6 +18,12 @@ wasn't working starts working again.
    - `ALLOWED_CHAT_IDS` — the chat ID(s) allowed to use the bot. Message
      [@userinfobot](https://t.me/userinfobot) to find your own chat ID
      (or a group's ID, if you want the bot usable in a group).
+   - *(optional)* `RESEND_API_KEY` — paste a [Resend](https://resend.com)
+     API key here to also get an emailed "Working ✅" alert whenever a
+     link starts working. Leave it blank to skip email alerts entirely.
+     `NOTIFY_EMAIL` is already set to `samirrahman097@gmail.com`; change
+     it if you want alerts sent elsewhere. See the **Email alerts**
+     section below for the sender-address caveat.
 
 4. Run it:
    ```
@@ -138,6 +144,26 @@ the parser instead of being shown as-is. The bot now uses HTML
 formatting with proper escaping (`&lt;`, `&gt;`, `&amp;`), which
 doesn't touch underscores, asterisks, or any other punctuation in
 URLs — links are always shown exactly as added.
+
+## Email alerts
+
+If you set `RESEND_API_KEY` in `bot.py`, the bot also sends a
+nicely-designed HTML email to `NOTIFY_EMAIL` every time a link starts
+working — alongside, not instead of, the Telegram message. Get a free
+API key at [resend.com](https://resend.com).
+
+Two things to know about the `from` address:
+- `RESEND_FROM_EMAIL` defaults to Resend's shared test address
+  (`onboarding@resend.dev`), which works with **zero setup** — but in
+  that mode Resend only lets you send to the email address you signed
+  up to Resend with.
+- To send to *any* address (like the `samirrahman097@gmail.com`
+  already configured), verify your own domain in the Resend dashboard
+  and set `RESEND_FROM_EMAIL` to an address on that domain, e.g.
+  `"URL Checker Bot <alerts@yourdomain.com>"`.
+
+Leaving `RESEND_API_KEY` blank disables email alerts entirely — the
+bot keeps working exactly as before, Telegram-only.
 
 ## Data storage
 
