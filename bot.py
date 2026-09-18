@@ -5,7 +5,8 @@ URL Checker Telegram Bot
 Monitors a list of URLs per chat and notifies the chat when a
 previously-down URL starts working again. Only responds to chat IDs
 listed in ALLOWED_CHAT_IDS. Each chat can track up to MAX_LINKS_PER_CHAT
-links (default 50).
+links (default 50). Optionally also emails NOTIFY_EMAIL via Resend
+whenever a link starts working (set RESEND_API_KEY to enable).
 
 Commands:
   /start                    - introduce the bot
@@ -59,6 +60,16 @@ REQUEST_TIMEOUT_SECONDS = 10
 MAX_PHOTO_BYTES = 8 * 1024 * 1024   # cap for images we download and re-upload to Telegram
 MAX_LINKS_PER_CHAT = 50             # cap on how many links a chat can track at once
 DHAKA_TZ = pytz.timezone("Asia/Dhaka")
+
+# Email alerts (via Resend - https://resend.com) sent alongside the Telegram
+# message whenever a link starts working. Paste your Resend API key below to
+# turn this on; leave it blank to skip email alerts entirely.
+RESEND_API_KEY = "re_WnZ4sA8t_FWa6jC1wAzJAYK9xvbAGHJqC"  # <-- paste your Resend API key here, e.g. "re_xxx..."
+# "from" must be a sender/domain verified in your Resend account. Resend's
+# shared "onboarding@resend.dev" address works with no setup, but in that
+# mode Resend only lets you send to the email you signed up with.
+RESEND_FROM_EMAIL = "URL Checker Bot <onboarding@resend.dev>"
+NOTIFY_EMAIL = "samirrahman097@gmail.com"
 
 # --------------------------------------------------------------------------
 # DATABASE
@@ -357,7 +368,14 @@ def guard(handler):
         if not is_allowed(message.chat.id):
             bot.reply_to(
                 message,
-                f"⛔ This bot is restricted. Your chat ID ({message.chat.id}) is not authorized.",
+                "🚫 <b>ACCESS DENIED!</b> 😂\n"
+                "Bro really thought this bot was free for you 💀\n\n"
+                "Your Chat ID:-\n\n"
+                f"<pre>{message.chat.id}</pre>\n\n"
+                "❌ Authorization: NOPE\n"
+                "Bot :- “Who invited this guy?”\n"
+                "Nice try, bro. Go touch grass and come back later 🤣\n\n"
+                "Want access? Ask permission to owner.",
             )
             return
         return handler(message)
@@ -754,9 +772,116 @@ def build_status_message(url: str, is_working: bool, code, reason: str) -> str:
     )
 
 
+def build_email_html(url: str, code, reason: str, time_str: str) -> str:
+    code_text = f"{code} {reason}" if code else "200 OK"
+    safe_url = html.escape(url)
+    return f"""\
+<!DOCTYPE html>
+<html>
+  <body style="margin:0;padding:0;background-color:#eef2f1;
+               font-family:'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="padding:40px 16px;">
+      <tr>
+        <td align="center">
+          <table role="presentation" width="480" cellpadding="0" cellspacing="0"
+                 style="background:#ffffff;border-radius:18px;overflow:hidden;
+                        box-shadow:0 8px 30px rgba(17,153,142,0.18);max-width:480px;width:100%;">
+            <tr>
+              <td style="background:linear-gradient(135deg,#11998e,#38ef7d);
+                         padding:36px 24px;text-align:center;">
+                <div style="font-size:52px;line-height:1;">✅</div>
+                <div style="color:#ffffff;font-size:24px;font-weight:700;margin-top:10px;
+                            letter-spacing:.3px;">Link is Working Again!</div>
+                <div style="color:#e7fff8;font-size:13px;margin-top:6px;">
+                  URL Checker Bot &middot; Automated Alert
+                </div>
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:28px 30px 8px 30px;">
+                <p style="margin:0 0 20px 0;color:#3a3a3a;font-size:15px;line-height:1.6;">
+                  Good news — one of your monitored links just started
+                  responding successfully. 🎉
+                </p>
+                <table role="presentation" width="100%" cellpadding="0" cellspacing="0"
+                       style="background:#f3faf8;border:1px solid #d8f0ea;border-radius:12px;
+                              padding:18px 20px;">
+                  <tr>
+                    <td style="padding-bottom:14px;">
+                      <div style="color:#7c8b88;font-size:11px;font-weight:700;
+                                  text-transform:uppercase;letter-spacing:.6px;">Status</div>
+                      <div style="color:#0f9b7e;font-size:17px;font-weight:700;margin-top:4px;">
+                        {code_text} &nbsp;&#9989; Working
+                      </div>
+                    </td>
+                  </tr>
+                  <tr>
+                    <td style="padding-bottom:14px;">
+                      <div style="color:#7c8b88;font-size:11px;font-weight:700;
+                                  text-transform:uppercase;letter-spacing:.6px;">URL</div>
+                      <div style="margin-top:4px;font-size:14px;word-break:break-all;">
+                        <a href="{safe_url}" style="color:#11998e;text-decoration:none;">{safe_url}</a>
+                      </div>
+                    </td>
+                  </tr>
+                  <tr>
+                    <td>
+                      <div style="color:#7c8b88;font-size:11px;font-weight:700;
+                                  text-transform:uppercase;letter-spacing:.6px;">Time (Dhaka)</div>
+                      <div style="color:#2b2b2b;font-size:14px;margin-top:4px;">{time_str}</div>
+                    </td>
+                  </tr>
+                </table>
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:18px 30px 30px 30px;text-align:center;">
+                <div style="height:1px;background:#eef2f1;margin-bottom:16px;"></div>
+                <p style="margin:0;color:#a1a8a6;font-size:12px;">
+                  Sent automatically by your URL Checker Bot 🤖
+                </p>
+              </td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+    </table>
+  </body>
+</html>"""
+
+
+def send_email_alert(url: str, code, reason: str, time_str: str):
+    """Sends a nicely-designed 'link is working' email via Resend.
+    Silently does nothing if RESEND_API_KEY hasn't been set."""
+    if not RESEND_API_KEY:
+        return
+    try:
+        resp = requests.post(
+            "https://api.resend.com/emails",
+            headers={
+                "Authorization": f"Bearer {RESEND_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "from": RESEND_FROM_EMAIL,
+                "to": [NOTIFY_EMAIL],
+                "subject": "✅ Your link is working again!",
+                "html": build_email_html(url, code, reason, time_str),
+            },
+            timeout=10,
+        )
+        if resp.status_code >= 300:
+            print(f"[email] Resend API error {resp.status_code}: {resp.text}")
+    except requests.RequestException as email_err:
+        print(f"[email] failed to send email alert: {email_err}")
+
+
 def send_status_update(chat_id: int, url: str, is_working: bool, code, reason: str,
                         content_type: str, image_bytes):
     text = build_status_message(url, is_working, code, reason)
+
+    if is_working:
+        send_email_alert(url, code, reason, now_dhaka_12h())
 
     if is_working and looks_like_image(url, content_type or ""):
         # Preferred: upload the bytes we already downloaded ourselves. This
